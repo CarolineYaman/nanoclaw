@@ -407,23 +407,45 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        'mcp__google_workspace__*'
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+      mcpServers: (() => {
+        const servers: Record<string, { command: string; args: string[]; env?: Record<string, string> }> = {
+          nanoclaw: {
+            command: 'node',
+            args: [mcpServerPath],
+            env: {
+              NANOCLAW_CHAT_JID: containerInput.chatJid,
+              NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+              NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            },
           },
-        },
-      },
+        };
+        const gwConfigPath = '/home/node/.config/google-workspace-mcp/config.json';
+        if (fs.existsSync(gwConfigPath)) {
+          try {
+            const gwConfig = JSON.parse(fs.readFileSync(gwConfigPath, 'utf-8'));
+            log('Google Workspace MCP server enabled');
+            servers.google_workspace = {
+              command: 'npx',
+              args: ['-y', '@dguido/google-workspace-mcp'],
+              env: {
+                GOOGLE_CLIENT_ID: gwConfig.clientId || '',
+                GOOGLE_CLIENT_SECRET: gwConfig.clientSecret || '',
+                GOOGLE_WORKSPACE_SERVICES: gwConfig.services || 'calendar,drive,docs',
+              },
+            };
+          } catch (err) {
+            log(`Failed to load Google Workspace config: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        return servers;
+      })(),
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },

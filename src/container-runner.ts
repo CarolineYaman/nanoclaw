@@ -6,6 +6,8 @@ import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
+import os from 'os';
+
 import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
@@ -198,6 +200,21 @@ function buildVolumeMounts(
     containerPath: '/app/src',
     readonly: false,
   });
+
+  // Google Workspace MCP: mount token/config directory so the agent can use
+  // Calendar, Drive, and Docs tools. Tokens are stored here after OAuth flow.
+  const googleWorkspaceMcpDir = path.join(
+    os.homedir(),
+    '.config',
+    'google-workspace-mcp',
+  );
+  if (fs.existsSync(googleWorkspaceMcpDir)) {
+    mounts.push({
+      hostPath: googleWorkspaceMcpDir,
+      containerPath: '/home/node/.config/google-workspace-mcp',
+      readonly: false,
+    });
+  }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
