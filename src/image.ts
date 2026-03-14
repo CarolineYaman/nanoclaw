@@ -32,7 +32,10 @@ export async function processImage(
   fs.mkdirSync(dir, { recursive: true });
 
   const resized = await sharp(buffer)
-    .resize(MAX_DIMENSION, MAX_DIMENSION, { fit: 'inside', withoutEnlargement: true })
+    .resize(MAX_DIMENSION, MAX_DIMENSION, {
+      fit: 'inside',
+      withoutEnlargement: true,
+    })
     .jpeg({ quality: JPEG_QUALITY })
     .toBuffer();
 
@@ -58,7 +61,9 @@ export async function processImage(
 export async function downloadFile(url: string): Promise<Buffer> {
   const response = await fetch(url);
   if (!response.ok) {
-    throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+    throw new Error(
+      `Download failed: ${response.status} ${response.statusText}`,
+    );
   }
   return Buffer.from(await response.arrayBuffer());
 }
