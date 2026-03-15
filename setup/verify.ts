@@ -96,13 +96,27 @@ export async function run(_args: string[]): Promise<void> {
     }
   }
 
-  // 3. Check credentials
+  // 3. Check credentials (.env keys OR Claude CLI OAuth credentials)
   let credentials = 'missing';
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
     if (/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=/m.test(envContent)) {
       credentials = 'configured';
+    }
+  }
+  // Also check Claude CLI credentials (auto-refreshed OAuth tokens)
+  if (credentials === 'missing') {
+    const cliCredsPath = path.join(homeDir, '.claude', '.credentials.json');
+    try {
+      if (fs.existsSync(cliCredsPath)) {
+        const creds = JSON.parse(fs.readFileSync(cliCredsPath, 'utf-8'));
+        if (creds.claudeAiOauth?.accessToken && creds.claudeAiOauth?.refreshToken) {
+          credentials = 'configured';
+        }
+      }
+    } catch {
+      // Ignore parse errors
     }
   }
 
