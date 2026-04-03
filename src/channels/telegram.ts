@@ -1,7 +1,17 @@
-import { Bot } from 'grammy';
+import fs from 'fs';
+import https from 'https';
+import path from 'path';
+import { Api, Bot } from 'grammy';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import {
+  getCurrentAuthMode,
+  hasValidOAuthCredentials,
+  switchAuthMode,
+} from '../auth-switch.js';
+import { ASSISTANT_NAME, DATA_DIR, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
+import { resolveGroupFolderPath } from '../group-folder.js';
+import { downloadFile, processImage } from '../image.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
@@ -17,6 +27,29 @@ export interface TelegramChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
+/**
+ * Send a message with Telegram Markdown parse mode, falling back to plain text.
+ * Claude's output naturally matches Telegram's Markdown v1 format:
+ *   *bold*, _italic_, `code`, ```code blocks```, [links](url)
+ */
+async function sendTelegramMessage(
+  api: { sendMessage: Api['sendMessage'] },
+  chatId: string | number,
+  text: string,
+  options: { message_thread_id?: number } = {},
+): Promise<void> {
+  try {
+    await api.sendMessage(chatId, text, {
+      ...options,
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    // Fallback: send as plain text if Markdown parsing fails
+    logger.debug({ err }, 'Markdown send failed, falling back to plain text');
+    await api.sendMessage(chatId, text, options);
+  }
+}
+
 export class TelegramChannel implements Channel {
   name = 'telegram';
 
@@ -29,8 +62,16 @@ export class TelegramChannel implements Channel {
     this.opts = opts;
   }
 
+  private resolveGroupDir(folder: string): string {
+    return resolveGroupFolderPath(folder);
+  }
+
   async connect(): Promise<void> {
-    this.bot = new Bot(this.botToken);
+    this.bot = new Bot(this.botToken, {
+      client: {
+        baseFetchConfig: { agent: https.globalAgent, compress: true },
+      },
+    });
 
     // Command to get chat ID (useful for registration)
     this.bot.command('chatid', (ctx) => {
@@ -50,6 +91,69 @@ export class TelegramChannel implements Channel {
     // Command to check bot status
     this.bot.command('ping', (ctx) => {
       ctx.reply(`${ASSISTANT_NAME} is online.`);
+    });
+
+    // Command to view or switch auth mode
+    this.bot.command('auth', async (ctx) => {
+      const args = ctx.message?.text?.split(/\s+/).slice(1) || [];
+      const current = getCurrentAuthMode();
+
+      if (args.length === 0) {
+        const label =
+          current === 'api-key' ? 'API Key' : 'OAuth (Subscription)';
+        const oauthStatus = hasValidOAuthCredentials()
+          ? 'valid'
+          : 'not found or expired';
+        ctx.reply(
+          `Auth mode: *${label}*\nOAuth credentials: ${oauthStatus}\n\nSwitch with:\n\`/auth api\` — use API key\n\`/auth oauth\` — use subscription`,
+          { parse_mode: 'Markdown' },
+        );
+        return;
+      }
+
+      const target = args[0].toLowerCase();
+      if (target !== 'api' && target !== 'oauth') {
+        ctx.reply('Usage: `/auth api` or `/auth oauth`', {
+          parse_mode: 'Markdown',
+        });
+        return;
+      }
+
+      const newMode = target === 'api' ? 'api-key' : 'oauth';
+      if (newMode === current) {
+        const label = current === 'api-key' ? 'API Key' : 'OAuth';
+        ctx.reply(`Already using ${label}.`);
+        return;
+      }
+
+      // Check OAuth credentials before switching
+      if (newMode === 'oauth' && !hasValidOAuthCredentials()) {
+        ctx.reply(
+          'No valid OAuth credentials found.\nRun `claude login` on the server first, then try again.',
+          { parse_mode: 'Markdown' },
+        );
+        return;
+      }
+
+      switchAuthMode(newMode as 'api-key' | 'oauth');
+      const label = newMode === 'api-key' ? 'API Key' : 'OAuth (Subscription)';
+      ctx.reply(`Switching to *${label}*...`, {
+        parse_mode: 'Markdown',
+      });
+
+      // Write flag so the bot sends a ready message after restart
+      const flagPath = path.join(DATA_DIR, 'auth-switch-pending.json');
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(
+        flagPath,
+        JSON.stringify({ chatId: ctx.chat.id, mode: newMode }),
+      );
+
+      // Restart the service so the credential proxy picks up the new mode
+      logger.info({ newMode }, 'Auth mode changed, restarting service');
+      setTimeout(() => {
+        process.exit(0); // systemd will restart us
+      }, 1000);
     });
 
     this.bot.on('message:text', async (ctx) => {
@@ -165,12 +269,108 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
+    this.bot.on('message:photo', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      try {
+        // Get the largest photo (last in the array)
+        const photos = ctx.message.photo;
+        const largest = photos[photos.length - 1];
+        const file = await ctx.api.getFile(largest.file_id);
+        const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+
+        const buffer = await downloadFile(fileUrl);
+        const groupDir = this.resolveGroupDir(group.folder);
+        const savePath = path.join(
+          groupDir,
+          'attachments',
+          `photo_${ctx.message.message_id}.jpg`,
+        );
+        const image = await processImage(buffer, savePath);
+
+        this.opts.onMessage(chatJid, {
+          id: ctx.message.message_id.toString(),
+          chat_jid: chatJid,
+          sender: ctx.from?.id?.toString() || '',
+          sender_name: senderName,
+          content: `[Photo: attachments/photo_${ctx.message.message_id}.jpg]${caption}`,
+          timestamp,
+          is_from_me: false,
+          images: [{ base64: image.base64, mimeType: image.mimeType }],
+        });
+
+        logger.info(
+          { chatJid, sender: senderName },
+          'Processed image attachment from Telegram',
+        );
+      } catch (err) {
+        logger.error({ chatJid, err }, 'Image - download/processing failed');
+        storeNonText(ctx, '[Photo - failed to process]');
+      }
+    });
+
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
-    this.bot.on('message:document', (ctx) => {
-      const name = ctx.message.document?.file_name || 'file';
+    this.bot.on('message:document', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const doc = ctx.message.document;
+      const name = doc?.file_name || 'file';
+      const mime = doc?.mime_type || '';
+
+      // Handle PDF documents specially — download to group workspace
+      if (mime === 'application/pdf') {
+        try {
+          const file = await ctx.api.getFile(doc!.file_id);
+          const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+          const buffer = await downloadFile(fileUrl);
+
+          const groupDir = this.resolveGroupDir(group.folder);
+          const attachDir = path.join(groupDir, 'attachments');
+          fs.mkdirSync(attachDir, { recursive: true });
+
+          const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+          const savePath = path.join(attachDir, safeName);
+          fs.writeFileSync(savePath, buffer);
+
+          logger.info(
+            { chatJid, file: safeName, size: buffer.length },
+            'Downloaded PDF attachment',
+          );
+
+          storeNonText(
+            ctx,
+            `[PDF document saved: attachments/${safeName} (${Math.round(buffer.length / 1024)}KB)]`,
+          );
+          return;
+        } catch (err) {
+          logger.error({ chatJid, err }, 'Failed to download PDF attachment');
+        }
+      }
+
       storeNonText(ctx, `[Document: ${name}]`);
     });
     this.bot.on('message:sticker', (ctx) => {
@@ -188,7 +388,7 @@ export class TelegramChannel implements Channel {
     // Start polling — returns a Promise that resolves when started
     return new Promise<void>((resolve) => {
       this.bot!.start({
-        onStart: (botInfo) => {
+        onStart: async (botInfo) => {
           logger.info(
             { username: botInfo.username, id: botInfo.id },
             'Telegram bot connected',
@@ -197,6 +397,27 @@ export class TelegramChannel implements Channel {
           console.log(
             `  Send /chatid to the bot to get a chat's registration ID\n`,
           );
+
+          // Send ready message if auth was just switched
+          try {
+            const flagPath = path.join(DATA_DIR, 'auth-switch-pending.json');
+            if (fs.existsSync(flagPath)) {
+              const flag = JSON.parse(fs.readFileSync(flagPath, 'utf-8'));
+              fs.unlinkSync(flagPath);
+              const mode = getCurrentAuthMode();
+              const label =
+                mode === 'api-key' ? 'API Key' : 'OAuth (Subscription)';
+              await sendTelegramMessage(
+                this.bot!.api,
+                flag.chatId,
+                `${ASSISTANT_NAME} is back online.\nAuth mode: *${label}*`,
+                {},
+              );
+            }
+          } catch (err) {
+            logger.debug({ err }, 'Failed to send auth switch notification');
+          }
+
           resolve();
         },
       });
@@ -215,10 +436,11 @@ export class TelegramChannel implements Channel {
       // Telegram has a 4096 character limit per message — split if needed
       const MAX_LENGTH = 4096;
       if (text.length <= MAX_LENGTH) {
-        await this.bot.api.sendMessage(numericId, text);
+        await sendTelegramMessage(this.bot.api, numericId, text);
       } else {
         for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await this.bot.api.sendMessage(
+          await sendTelegramMessage(
+            this.bot.api,
             numericId,
             text.slice(i, i + MAX_LENGTH),
           );

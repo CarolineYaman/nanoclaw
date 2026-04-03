@@ -114,13 +114,57 @@ Run `npx tsx setup/index.ts --step container -- --runtime <chosen>` and parse th
 
 ## 4. Claude Authentication (No Script)
 
-If HAS_ENV=true from step 2, read `.env` and check for `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. If present, confirm with user: keep or reconfigure?
+NanoClaw supports two auth modes that users can switch between at runtime via the `/auth` Telegram command. **Always set up OAuth first** (it's the primary method), then optionally collect an API key as a fallback.
 
-AskUserQuestion: Claude subscription (Pro/Max) vs Anthropic API key?
+### 4a. OAuth setup (always)
 
-**Subscription:** Tell user to run `claude setup-token` in another terminal, copy the token, add `CLAUDE_CODE_OAUTH_TOKEN=<token>` to `.env`. Do NOT collect the token in chat.
+OAuth reads tokens automatically from `~/.claude/.credentials.json` — the file managed by the Claude CLI. No manual token copying is needed.
 
-**API key:** Tell user to add `ANTHROPIC_API_KEY=<key>` to `.env`.
+Check if credentials already exist:
+```bash
+test -f ~/.claude/.credentials.json && echo "EXISTS" || echo "NOT_FOUND"
+```
+
+**If EXISTS:** Verify the token is valid — read the file and check that `claudeAiOauth.accessToken` and `claudeAiOauth.refreshToken` are present and `expiresAt` is in the future. If valid, tell the user: "Claude CLI OAuth credentials found — these will be used automatically."
+
+**If NOT_FOUND or invalid:** Tell the user:
+
+> You need to log in to the Claude CLI so NanoClaw can use your subscription.
+> In another terminal, run:
+> ```
+> claude login
+> ```
+> Let me know once that's done.
+
+After the user confirms, re-check the file exists and is valid.
+
+### 4b. API key and default mode
+
+Check `.env` for an existing `ANTHROPIC_API_KEY` (commented or uncommented).
+
+**If an API key already exists (commented or uncommented):** Both auth methods are available. Ask the user which should be the default:
+
+AskUserQuestion: You have both OAuth (Claude subscription) and an API key configured. Which should be the default auth mode? (You can switch anytime via `/auth` in Telegram.)
+
+- **OAuth (Recommended)** — Uses your Claude Pro/Max subscription. Comment out the API key in `.env`:
+  ```
+  #ANTHROPIC_API_KEY=sk-ant-...
+  ```
+- **API Key** — Uses pay-per-use Anthropic API. Leave the API key uncommented in `.env`.
+
+Apply the chosen default by commenting/uncommenting the `ANTHROPIC_API_KEY` line in `.env` accordingly.
+
+**If no API key exists at all:**
+
+AskUserQuestion: Do you also want to add an Anthropic API key? This enables the `/auth` command to switch between your subscription and pay-per-use API. You can skip this and add one later.
+
+**Yes:** Tell the user to add `ANTHROPIC_API_KEY=<key>` to `.env`. Comment it out so OAuth is the default:
+```
+#ANTHROPIC_API_KEY=sk-ant-...
+```
+The `/auth` command will uncomment it when switching to API key mode.
+
+**No/Skip:** Continue. OAuth-only is fine — the `/auth` command will report that no API key is configured if the user tries to switch.
 
 ## 5. Set Up Channels
 
